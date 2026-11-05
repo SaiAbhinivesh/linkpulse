@@ -1,0 +1,96 @@
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+default:
+  image: python:3.12-slim
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  key:
+    files:
+      - requirements-dev.txt
+  paths:
+    - .cache/pip
+
+lint:
+  stage: lint
+  script:
+    - pip install ruff
+    - ruff check .
+    - ruff format --check .
+
+test:
+  stage: test
+  services:
+    - name: postgres:17
+      alias: postgres
+  variables:
+    POSTGRES_USER: linkpulse
+    POSTGRES_PASSWORD: linkpulse
+    POSTGRES_DB: linkpulse_test
+    DATABASE_URL: postgresql+psycopg://linkpulse:linkpulse@postgres:5432/linkpulse_test
+    TEST_DATABASE_URL: postgresql+psycopg://linkpulse:linkpulse@postgres:5432/linkpulse_test
+    REDIS_URL: redis://localhost:6379/0
+  script:
+    - pip install -r requirements-dev.txt
+    - pytest -v --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+
+build:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+  rules:
+    # only on main, and only when the AWS variables exist (forks without AWS skip this job)
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ECR_REGISTRY && $EC2_HOST
+  before_script:
+    - apk add --no-cache aws-cli
+    - aws ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+  script:
+    - docker build --build-arg APP_VERSION="$CI_COMMIT_SHORT_SHA" -t "$ECR_REGISTRY/linkpulse:$CI_COMMIT_SHORT_SHA" .
+    - docker push "$ECR_REGISTRY/linkpulse:$CI_COMMIT_SHORT_SHA"
+
+deploy:
+  stage: deploy
+  image: alpine:3
+  rules:
+    # only on main, and only when the AWS variables exist (forks without AWS skip this job)
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $ECR_REGISTRY && $EC2_HOST
+  environment:
+    name: production
+    url: http://$EC2_HOST
+  before_script:
+    - apk add --no-cache aws-cli openssh-client curl
+    - curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x /usr/local/bin/kubectl
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - cp "$SSH_KNOWN_HOSTS" ~/.ssh/known_hosts
+    - chmod 600 "$SSH_PRIVATE_KEY"
+  script:
+    - REMOTE="ssh -i $SSH_PRIVATE_KEY ubuntu@$EC2_HOST"
+    - 'sed -i "s/newTag: .*/newTag: $CI_COMMIT_SHORT_SHA/" k8s/overlays/aws/kustomization.yaml'
+    - kubectl create secret docker-registry ecr-pull --docker-server="$ECR_REGISTRY" --docker-username=AWS --docker-password="$(aws ecr get-login-password)" -n linkpulse --dry-run=client -o yaml | $REMOTE "sudo k3s kubectl apply -f -"
+    - $REMOTE "sudo k3s kubectl -n linkpulse delete job migrate --ignore-not-found"
+    - kubectl kustomize k8s/overlays/aws | $REMOTE "sudo k3s kubectl apply -f -"
+    - $REMOTE "sudo k3s kubectl -n linkpulse wait --for=condition=complete job/migrate --timeout=180s"
+    - $REMOTE "sudo k3s kubectl -n linkpulse rollout status deployment/api --timeout=180s"
+    - $REMOTE "sudo k3s kubectl -n linkpulse rollout status deployment/worker --timeout=180s"
+    - curl -fsS "http://$EC2_HOST/health"

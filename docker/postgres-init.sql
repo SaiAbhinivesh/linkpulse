@@ -1,0 +1,1 @@
+CREATE DATABASE linkpulse_test;
